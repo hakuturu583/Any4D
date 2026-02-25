@@ -796,16 +796,24 @@ def compute_static_mask(
     return static_mask
 
 
-def select_temporal_frame_indices(total_frames: int, n_frames: int) -> list[int]:
+def select_temporal_frame_indices(
+    total_frames: int, n_frames: int, stride: int = 1
+) -> list[int]:
     """
     時系列推論用フレームインデックスを選択する。
-    動画中央のフレームを参照フレームとして、そこから連続する n_frames 個を返す。
+    動画中央のフレームを参照フレームとして、stride 間隔で n_frames 個を返す。
     リスト先頭が参照フレーム（view0）。
 
-    例: total_frames=605, n_frames=4 → [302, 303, 304, 305]
+    stride を大きくするほど frames 間の時間差が広がり、
+    scene_flow から動的物体を検出しやすくなる。
+
+    例:
+        total_frames=605, n_frames=4, stride=1  → [302, 303, 304, 305]
+        total_frames=605, n_frames=4, stride=5  → [302, 307, 312, 317]
+        total_frames=605, n_frames=4, stride=10 → [302, 312, 322, 332]
     """
     ref = total_frames // 2
-    indices = [min(ref + i, total_frames - 1) for i in range(n_frames)]
+    indices = [min(ref + i * stride, total_frames - 1) for i in range(n_frames)]
     return indices
 
 
@@ -1120,11 +1128,12 @@ def main():
         total_frames = len(cam_reader.timestamps)
         if num_cameras == 1:
             # 時系列モード: 動画中央から連続フレームを選択
-            frame_indices = select_temporal_frame_indices(total_frames, n_frames)
+            frame_indices = select_temporal_frame_indices(total_frames, n_frames, stride=args.frame_stride)
         else:
             # 空間マルチカメラモード: 等間隔サンプリング
             frame_indices = select_frame_indices(total_frames, n_frames)
-        print(f"  全{total_frames}フレーム中 {len(frame_indices)} フレームを選択 (indices={frame_indices})")
+        print(f"  全{total_frames}フレーム中 {len(frame_indices)} フレームを選択 "
+              f"(stride={args.frame_stride}, indices={frame_indices})")
 
         # このカメラの intrinsics 行を取得
         intr_row = _get_sensor_row(intr_df, cam_name)
@@ -1450,6 +1459,16 @@ def get_parser():
         type=int,
         default=None,
         help="1カメラあたりの選択フレーム数（単一カメラ時は省略で 4、複数カメラ時は auto）",
+    )
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        default=1,
+        help=(
+            "時系列フレームのサンプリング間隔。"
+            "大きくするほど frames 間の時間差が広がり scene_flow から動的物体を除去しやすくなる。"
+            "30fps 映像なら stride=5〜10 推奨（約0.17〜0.33秒間隔）。"
+        ),
     )
 
     # フィルタ
