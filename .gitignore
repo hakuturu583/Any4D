@@ -6,6 +6,7 @@ reference_data/
 # PhysicalAI-AV dataset cache & outputs
 data/physai_av_cache/
 outputs/physai_av/
+outputs/*.mp4
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
