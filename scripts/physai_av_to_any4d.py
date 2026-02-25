@@ -596,22 +596,13 @@ def build_any4d_view(
 # --------------------------------------------------------
 # 13. メイン推論
 # --------------------------------------------------------
-def run_inference(views: list[dict], args) -> dict:
+def _init_any4d_model(args):
     """
-    Any4D 推論を実行する。
+    Any4D モデルを初期化して (model, device) を返す。
 
-    1. validate_input_views_for_inference(views)
-    2. preprocess_input_views_for_inference(views)
-    3. sample_inference(model, preprocessed_views, ...)
-
-    Args:
-        views: build_any4d_view で生成したビューのリスト
-        args: argparse.Namespace
-
-    Returns:
-        推論結果辞書
+    スライディングウィンドウなど複数回推論が必要な場合に、
+    モデルを1回だけ初期化して使い回すための関数。
     """
-    # モデル設定
     config = {
         "path": os.path.join(args.config_dir, "train.yaml"),
         "config_overrides": [
@@ -624,32 +615,61 @@ def run_inference(views: list[dict], args) -> dict:
         "trained_with_amp": True,
         "data_norm_type": "dinov2",
     }
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[inference] device={device}")
-
-    # モデル初期化
     model = init_inference_model(config, args.checkpoint_path, device)
-
-    # scene_flow 出力を有効化: model.scene_rep_type を実行時にパッチ
-    # any4d_4v_combined.pth は scene_flow ヘッドを持つため、
-    # scene_rep_type を変えるだけで scene_flow がロールアウトされる
     original_scene_rep_type = model.scene_rep_type
     model.scene_rep_type = "raydirs+depth+pose+scene_flow+confidence+mask"
     print(f"[inference] scene_rep_type: {original_scene_rep_type} → {model.scene_rep_type}")
+    return model, device
 
-    # ビュー検証
-    print("[inference] validate_input_views_for_inference ...")
+
+def _infer_with_model(
+    model,
+    device,
+    views: list[dict],
+    verbose: bool = True,
+) -> tuple[dict, list]:
+    """
+    初期化済みモデルで推論を実行し (result, preprocessed_views) を返す。
+
+    Args:
+        model: _init_any4d_model で初期化済みのモデル
+        device: 推論デバイス
+        views: build_any4d_view で生成したビューのリスト（相対姿勢変換済み）
+        verbose: 進行状況を表示するか
+
+    Returns:
+        (result, preprocessed_views) タプル
+    """
+    if verbose:
+        print("[inference] validate_input_views_for_inference ...")
     validated_views = validate_input_views_for_inference(views)
 
-    # ビュー前処理
-    print("[inference] preprocess_input_views_for_inference ...")
+    if verbose:
+        print("[inference] preprocess_input_views_for_inference ...")
     preprocessed_views = preprocess_input_views_for_inference(validated_views)
 
-    # 推論
-    print(f"[inference] sample_inference ({len(preprocessed_views)} views) ...")
+    if verbose:
+        print(f"[inference] sample_inference ({len(preprocessed_views)} views) ...")
     result = sample_inference(model, preprocessed_views, device, use_amp=True)
 
+    return result, preprocessed_views
+
+
+def run_inference(views: list[dict], args) -> dict:
+    """
+    Any4D 推論を実行する（シングルウィンドウ・後方互換）。
+
+    Args:
+        views: build_any4d_view で生成したビューのリスト（相対姿勢変換済み）
+        args: argparse.Namespace
+
+    Returns:
+        推論結果辞書
+    """
+    model, device = _init_any4d_model(args)
+    result, _ = _infer_with_model(model, device, views)
     return result
 
 
@@ -745,54 +765,57 @@ def compute_static_mask(
     num_views: int,
     H: int,
     W: int,
-    threshold: float = 0.1,
+    sf_percentile: float = 0.90,
 ) -> torch.Tensor:
     """
-    全時系列フレームの scene_flow magnitude を集約し、static 画素マスクを返す。
+    世界座標系の scene_flow magnitude のパーセンタイル閾値で動的画素を検出。
 
-    あるピクセルが「静的」とみなされるのは、全ての非参照フレームとの比較で
-    scene_flow ノルム < threshold（メートル）の場合。
+    全時系列フレームの magnitude をプールし、sf_percentile 以上の画素を動的とみなす。
+    sf_percentile=0.90 なら上位10%、0.85 なら上位15%が動的判定される。
 
     Args:
         result: sample_inference の戻り値辞書
         num_views: 総ビュー数（reference 1 + temporal N-1）
         H, W: 画像の高さ・幅
-        threshold: 動的とみなす scene_flow ノルムの閾値 [m]
+        sf_percentile: 動的判定の下限パーセンタイル（0〜1）。小さいほど厳しい判定
 
     Returns:
         (H, W) bool tensor。True = 静的画素
     """
-    # 利用可能キーを診断出力
-    pred1_keys = sorted(result.get("pred1", {}).keys())
-    pred2_keys = sorted(result.get("pred2", {}).keys()) if num_views > 1 else []
-    print(f"  [static_mask] pred1 keys: {pred1_keys}")
-    if pred2_keys:
-        print(f"  [static_mask] pred2 keys: {pred2_keys}")
+    # 1. 全フレームの magnitude と per-frame テンソルを収集
+    all_magnitudes = []
+    per_frame_magnitudes = []
 
-    dynamic_accum = torch.zeros(H, W, dtype=torch.bool)
-    n_sf_views = 0
     for i in range(1, num_views):
         pred = result.get(f"pred{i+1}", {})
         if "scene_flow" not in pred:
             continue
-        sf = pred["scene_flow"][0].cpu()  # (H, W, 3)
-        magnitude = sf.norm(dim=-1)       # (H, W)
-        n_dynamic = int((magnitude > threshold).sum().item())
-        print(f"  [static_mask] pred{i+1} scene_flow: "
-              f"max={magnitude.max():.3f}m  mean={magnitude.mean():.3f}m  "
-              f"dynamic_pixels(>{threshold}m)={n_dynamic}/{H*W} "
-              f"({100*n_dynamic/(H*W):.1f}%)")
-        dynamic_accum |= (magnitude > threshold)
-        n_sf_views += 1
+        sf = pred["scene_flow"][0].cpu()   # (H, W, 3)  ← cam0/allo 座標系
+        mag = sf.norm(dim=-1)              # (H, W)
+        all_magnitudes.append(mag.flatten())
+        per_frame_magnitudes.append((i + 1, mag))
 
-    if n_sf_views == 0:
+    if not all_magnitudes:
         print("  [static_mask] ⚠ scene_flow が見つかりません。全画素を static とみなします。")
         return torch.ones(H, W, dtype=torch.bool)
 
+    # 2. τ = sf_percentile パーセンタイル
+    pooled = torch.cat(all_magnitudes)
+    tau = torch.quantile(pooled, sf_percentile)
+
+    print(f"  [static_mask] scene_flow: p{sf_percentile*100:.0f}={tau:.4f}m  (median={pooled.median():.4f}m)")
+
+    # 3. 各フレームで動的判定し OR 集約
+    dynamic_accum = torch.zeros(H, W, dtype=torch.bool)
+    for pred_idx, mag in per_frame_magnitudes:
+        n_dyn = int((mag > tau).sum().item())
+        print(f"  [static_mask] pred{pred_idx}: "
+              f"dynamic(>{tau:.4f}m)={n_dyn}/{H*W} ({100*n_dyn/(H*W):.1f}%)")
+        dynamic_accum |= (mag > tau)
+
     static_mask = ~dynamic_accum
     n_static = int(static_mask.sum().item())
-    print(f"  [static_mask] {n_sf_views} フレームの scene_flow を集約 "
-          f"(threshold={threshold}m) → static: {n_static}/{H*W} ({100*n_static/(H*W):.1f}%)")
+    print(f"  [static_mask] → static: {n_static}/{H*W} ({100*n_static/(H*W):.1f}%)")
     return static_mask
 
 
@@ -910,7 +933,7 @@ def save_pointcloud_render_mp4(
     output_path: str,
     fps: float = 10.0,
     max_depth: float = 40.0,
-    sf_threshold: float = 0.1,
+    sf_percentile: float = 0.90,
     point_radius: int = 1,
     side_by_side: bool = True,
 ) -> None:
@@ -926,7 +949,7 @@ def save_pointcloud_render_mp4(
         output_path: 出力 MP4 パス (.mp4)
         fps: フレームレート
         max_depth: レンダリング対象の最大深度 [m]
-        sf_threshold: 動的判定閾値 [m]
+        sf_percentile: 動的判定パーセンタイル（0〜1）。小さいほど厳しい判定
         point_radius: 点の描画膨張半径 (pixel)
         side_by_side: True の場合、元画像と点群レンダリングを横並びで出力
     """
@@ -949,7 +972,7 @@ def save_pointcloud_render_mp4(
     colors_rgb = (to_rgb(preprocessed_views[0]["img"], norm_type="dinov2")[0] * 255).astype(np.uint8)  # (H, W, 3)
 
     # static + 深度マスク
-    static_mask = compute_static_mask(result, n_views, H_inf, W_inf, threshold=sf_threshold)
+    static_mask = compute_static_mask(result, n_views, H_inf, W_inf, sf_percentile=sf_percentile)
     depth_z_ref = pts3d[..., 2]
     depth_mask = (depth_z_ref > 0.01) & (depth_z_ref < max_depth)
     combined_mask = static_mask.numpy() & depth_mask  # (H, W) bool
@@ -995,6 +1018,123 @@ def save_pointcloud_render_mp4(
 
     writer.release()
     print(f"[render_mp4] 保存完了: {output_path}")
+
+
+# --------------------------------------------------------
+# 16b. スライディングウィンドウ推論・MP4 保存
+# --------------------------------------------------------
+def _make_relative_views(window_views: list[dict]) -> list[dict]:
+    """
+    絶対ワールド座標の camera_poses を持つビューリストを
+    ビュー0 基準の相対姿勢に変換したシャローコピーを返す。
+
+    元のビューの camera_poses テンソルは変更しない。
+    """
+    if not window_views or "camera_poses" not in window_views[0]:
+        return window_views
+    T_world_cam0 = window_views[0]["camera_poses"][0]   # (4, 4)
+    T_cam0_world = torch.inverse(T_world_cam0)
+    result = []
+    for view in window_views:
+        T_world_cami = view["camera_poses"][0]           # (4, 4)
+        T_cam0_cami = T_cam0_world @ T_world_cami        # (4, 4)
+        result.append({**view, "camera_poses": T_cam0_cami.unsqueeze(0)})
+    return result
+
+
+def save_sliding_window_mp4(
+    all_views_world: list[dict],
+    model,
+    device,
+    output_path: str,
+    window_size: int,
+    window_stride: int,
+    fps: float,
+    max_depth: float,
+    sf_percentile: float,
+    side_by_side: bool,
+) -> None:
+    """
+    スライディングウィンドウで各 reference frame を推論し MP4 に保存する。
+
+    window_size フレームを 1 ウィンドウとして window_stride ずつずらしながら推論する。
+    各ウィンドウの reference frame（先頭フレーム）の点群を 1 フレームとして出力する。
+
+    Args:
+        all_views_world: 絶対ワールド姿勢の camera_poses を持つビューリスト
+        model: _init_any4d_model で初期化済みのモデル
+        device: 推論デバイス
+        output_path: 出力 MP4 パス
+        window_size: 1 ウィンドウのフレーム数
+        window_stride: ウィンドウのスライド幅（フレーム数）。window_size の半分で 50% オーバーラップ
+        fps: 出力 MP4 のフレームレート
+        max_depth: レンダリング対象の最大深度 [m]
+        side_by_side: True の場合、元画像と点群レンダリングを横並びで出力
+    """
+    from any4d.utils.geometry import recover_pinhole_intrinsics_from_ray_directions
+    from any4d.utils.image import rgb as to_rgb
+
+    total = len(all_views_world)
+    window_starts = list(range(0, total - window_size + 1, window_stride))
+    if not window_starts:
+        print(f"[sliding_mp4] ⚠ ウィンドウが作れません "
+              f"(total={total} < window_size={window_size})。"
+              f"--num_frames を増やすか --window_size を小さくしてください。")
+        return
+
+    overlap = window_size - window_stride
+    print(f"[sliding_mp4] {len(window_starts)} windows "
+          f"(size={window_size}, stride={window_stride}, overlap={overlap}) → {output_path}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    writer = None
+
+    for wi, start in enumerate(window_starts):
+        window_views_world = all_views_world[start:start + window_size]
+        window_views_rel = _make_relative_views(window_views_world)
+
+        result, preprocessed = _infer_with_model(model, device, window_views_rel, verbose=False)
+
+        H = preprocessed[0]["img"].shape[-2]
+        W = preprocessed[0]["img"].shape[-1]
+        static_mask = compute_static_mask(result, len(window_views_rel), H, W, sf_percentile=sf_percentile)
+
+        # reference frame（ウィンドウ先頭）の点群を cam0 座標系でレンダリング
+        ray_dirs = result["pred1"]["ray_directions"][0].cpu()
+        K_infer = recover_pinhole_intrinsics_from_ray_directions(ray_dirs).numpy()
+        pts3d = result["pred1"]["pts3d"][0].cpu().numpy()          # (H, W, 3) in cam0
+        colors_rgb = (to_rgb(preprocessed[0]["img"], norm_type="dinov2")[0] * 255).astype(np.uint8)
+
+        depth_mask = (pts3d[..., 2] > 0.01) & (pts3d[..., 2] < max_depth)
+        combined_mask = static_mask.numpy() & depth_mask
+
+        rendered = render_pointcloud_to_image(
+            pts3d, colors_rgb, K_infer, np.eye(4, dtype=np.float64),
+            H, W, mask=combined_mask, point_radius=1,
+        )
+        rendered_bgr = cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR)
+
+        if side_by_side:
+            orig_rgb = (to_rgb(preprocessed[0]["img"], norm_type="dinov2")[0] * 255).astype(np.uint8)
+            orig_bgr = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
+            if orig_bgr.shape[:2] != (H, W):
+                orig_bgr = cv2.resize(orig_bgr, (W, H))
+            frame_bgr = np.concatenate([orig_bgr, rendered_bgr], axis=1)
+        else:
+            frame_bgr = rendered_bgr
+
+        if writer is None:
+            fh, fw = frame_bgr.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (fw, fh))
+
+        writer.write(frame_bgr)
+        print(f"  [sliding_mp4] window {wi + 1}/{len(window_starts)}: "
+              f"frames[{start}~{start + window_size - 1}] 完了 (ref={start})")
+
+    if writer:
+        writer.release()
+    print(f"[sliding_mp4] 保存完了: {output_path}")
 
 
 # --------------------------------------------------------
@@ -1239,6 +1379,15 @@ def main():
 
     print(f"\n[main] 合計 {len(all_views)} ビューで推論を実行します。")
 
+    # ---- スライディングウィンドウ用に絶対姿勢をコピーして保存 ----
+    # 後続の相対姿勢変換（in-place）の前に world 座標系の poses を退避する。
+    if args.sliding_mp4 is not None:
+        all_views_world = [
+            {**v, "camera_poses": v["camera_poses"].clone()}
+            if "camera_poses" in v else dict(v)
+            for v in all_views
+        ]
+
     # ---- カメラ姿勢をビュー0基準の相対座標に変換 ----
     # モデルは学習時に view0 = 参照フレームとして相対姿勢で訓練されている。
     # compute_cam2world が返す T_world_cam は絶対ワールド座標なので、
@@ -1286,8 +1435,7 @@ def main():
         # ---- static マスク計算 ----
         # 全時系列フレームの scene_flow magnitude を集約し、
         # 閾値以上の動きがある画素を動的とみなして除去する
-        static_mask = compute_static_mask(result, len(preprocessed), H_v, W_v,
-                                          threshold=args.sf_threshold)
+        static_mask = compute_static_mask(result, len(preprocessed), H_v, W_v, sf_percentile=args.sf_percentile)
         n_static = int(static_mask.sum().item())
         n_total = H_v * W_v
         print(f"[viz] static マスク: {n_static}/{n_total} 画素 "
@@ -1347,8 +1495,24 @@ def main():
             output_path=mp4_path,
             fps=args.mp4_fps,
             max_depth=args.max_depth,
-            sf_threshold=args.sf_threshold,
+            sf_percentile=args.sf_percentile,
             point_radius=1,
+            side_by_side=not args.mp4_no_side_by_side,
+        )
+
+    # ---- スライディングウィンドウ MP4 ----
+    if args.sliding_mp4 is not None:
+        sw_model, sw_device = _init_any4d_model(args)
+        save_sliding_window_mp4(
+            all_views_world=all_views_world,
+            model=sw_model,
+            device=sw_device,
+            output_path=args.sliding_mp4,
+            window_size=args.window_size,
+            window_stride=args.window_stride,
+            fps=args.mp4_fps,
+            max_depth=args.max_depth,
+            sf_percentile=args.sf_percentile,
             side_by_side=not args.mp4_no_side_by_side,
         )
 
@@ -1357,6 +1521,8 @@ def main():
     print("  - スパース深度マップ: depth/")
     if args.save_mp4 is not None:
         print(f"  - 点群レンダリング MP4: {mp4_path}")
+    if args.sliding_mp4 is not None:
+        print(f"  - スライディングウィンドウ MP4: {args.sliding_mp4}")
 
 
 # --------------------------------------------------------
@@ -1540,12 +1706,6 @@ def get_parser():
         help="rerun ポート",
     )
     parser.add_argument(
-        "--sf_threshold",
-        type=float,
-        default=0.1,
-        help="scene_flow の動的判定閾値 [m]。この値以上移動した画素を動的とみなし除去する。",
-    )
-    parser.add_argument(
         "--max_depth",
         type=float,
         default=40.0,
@@ -1582,6 +1742,43 @@ def get_parser():
         "--mp4_no_side_by_side",
         action="store_true",
         help="点群レンダリングのみ出力（デフォルトは元画像と横並び）",
+    )
+    parser.add_argument(
+        "--sf_percentile",
+        type=float,
+        default=0.90,
+        help=(
+            "動的物体判定のパーセンタイル閾値（0〜1）。"
+            "この値以上の scene_flow magnitude を持つ画素を動的とみなす。"
+            "小さいほど厳しい判定（例: 0.85=上位15%%、0.90=上位10%%、0.95=上位5%%）。"
+        ),
+    )
+
+    # スライディングウィンドウ
+    parser.add_argument(
+        "--sliding_mp4",
+        type=str,
+        default=None,
+        help=(
+            "スライディングウィンドウ MP4 の出力パス。"
+            "指定するとウィンドウをずらしながら推論し、各 reference frame を 1 フレームとして MP4 に保存する。"
+        ),
+    )
+    parser.add_argument(
+        "--window_size",
+        type=int,
+        default=8,
+        help="スライディングウィンドウのフレーム数（1 回の推論で使うフレーム数）",
+    )
+    parser.add_argument(
+        "--window_stride",
+        type=int,
+        default=4,
+        help=(
+            "ウィンドウのスライド幅（フレーム数）。"
+            "window_size の半分で 50%% オーバーラップ（デフォルト）。"
+            "小さいほど密な再構成になるが推論回数が増える。"
+        ),
     )
 
     return parser
