@@ -796,6 +796,185 @@ def select_temporal_frame_indices(total_frames: int, n_frames: int) -> list[int]
 
 
 # --------------------------------------------------------
+# 16a. 点群レンダリング
+# --------------------------------------------------------
+def render_pointcloud_to_image(
+    pts3d_cam0: np.ndarray,
+    colors_rgb: np.ndarray,
+    K: np.ndarray,
+    T_cam0_cami: np.ndarray,
+    out_h: int,
+    out_w: int,
+    mask: np.ndarray | None = None,
+    point_radius: int = 1,
+) -> np.ndarray:
+    """
+    点群 (cam0 座標系) をカメラ i の視点からレンダリングして (out_h, out_w, 3) uint8 を返す。
+
+    Args:
+        pts3d_cam0: cam0 座標系の点群 (H, W, 3) または (N, 3)
+        colors_rgb: 対応する RGB 色 (H, W, 3) または (N, 3) uint8
+        K: ピンホール内部行列 (3, 3)
+        T_cam0_cami: cam_i → cam0 変換行列 (4, 4)。
+                     逆行列で cam0 → cam_i 変換として使用する。
+        out_h, out_w: 出力解像度
+        mask: 有効点マスク (H, W) または (N,) bool
+        point_radius: 膨張半径 (pixel)。0 で膨張なし。
+
+    Returns:
+        (out_h, out_w, 3) uint8 RGB レンダリング画像。背景は黒。
+    """
+    pts = pts3d_cam0.reshape(-1, 3).astype(np.float32)
+    cols = colors_rgb.reshape(-1, 3).astype(np.uint8)
+
+    if mask is not None:
+        m = mask.reshape(-1).astype(bool)
+        pts = pts[m]
+        cols = cols[m]
+
+    if len(pts) == 0:
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+
+    # T_cami_cam0 = inv(T_cam0_cami) : cam0 → cam_i
+    T_np = np.array(T_cam0_cami, dtype=np.float64)
+    T_cami_cam0 = np.linalg.inv(T_np)
+
+    N = pts.shape[0]
+    pts_h = np.hstack([pts.astype(np.float64), np.ones((N, 1))])  # (N, 4)
+    pts_cami = (T_cami_cam0 @ pts_h.T).T[:, :3].astype(np.float32)  # (N, 3)
+
+    # カメラ前方の点のみ
+    valid = pts_cami[:, 2] > 0.01
+    pts_cami = pts_cami[valid]
+    cols = cols[valid]
+
+    if len(pts_cami) == 0:
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+
+    # ピンホール投影
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    z = pts_cami[:, 2]
+    u = pts_cami[:, 0] / z * fx + cx
+    v = pts_cami[:, 1] / z * fy + cy
+
+    ui = np.round(u).astype(np.int32)
+    vi = np.round(v).astype(np.int32)
+    in_bounds = (ui >= 0) & (ui < out_w) & (vi >= 0) & (vi < out_h)
+    ui, vi, z, cols = ui[in_bounds], vi[in_bounds], z[in_bounds], cols[in_bounds]
+
+    if len(ui) == 0:
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+
+    # 遠→近の順で描画 (painter's algorithm)
+    order = np.argsort(z)[::-1]
+    canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    canvas[vi[order], ui[order]] = cols[order]
+
+    # 点を膨張させて穴を減らす
+    if point_radius > 0:
+        k = 2 * point_radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dilated = cv2.dilate(canvas, kernel)
+        bg = np.all(canvas == 0, axis=-1)
+        canvas[bg] = dilated[bg]
+
+    return canvas
+
+
+def save_pointcloud_render_mp4(
+    result: dict,
+    preprocessed_views: list,
+    output_path: str,
+    fps: float = 10.0,
+    max_depth: float = 40.0,
+    sf_threshold: float = 0.1,
+    point_radius: int = 1,
+    side_by_side: bool = True,
+) -> None:
+    """
+    推論結果の点群を各フレームのカメラ視点からレンダリングして MP4 に保存する。
+
+    reference frame (pred1) の点群 (cam0 座標系) を、各時刻フレームで予測された
+    カメラ姿勢に基づいて投影し、1フレームずつ OpenCV で描画して動画にまとめる。
+
+    Args:
+        result: sample_inference の戻り値
+        preprocessed_views: preprocess_input_views_for_inference 後のビューリスト
+        output_path: 出力 MP4 パス (.mp4)
+        fps: フレームレート
+        max_depth: レンダリング対象の最大深度 [m]
+        sf_threshold: 動的判定閾値 [m]
+        point_radius: 点の描画膨張半径 (pixel)
+        side_by_side: True の場合、元画像と点群レンダリングを横並びで出力
+    """
+    from any4d.utils.geometry import (
+        quaternion_to_rotation_matrix,
+        recover_pinhole_intrinsics_from_ray_directions,
+    )
+    from any4d.utils.image import rgb as to_rgb
+
+    n_views = len(preprocessed_views)
+
+    # ray_directions から inference 解像度の K を復元
+    ray_dirs = result["pred1"]["ray_directions"][0].cpu()  # (H, W, 3)
+    K_infer = recover_pinhole_intrinsics_from_ray_directions(ray_dirs).numpy()  # (3, 3)
+
+    # reference frame の点群と色
+    pts3d = result["pred1"]["pts3d"][0].cpu().numpy()       # (H, W, 3) in cam0
+    H_inf, W_inf = pts3d.shape[:2]
+    colors_rgb = to_rgb(preprocessed_views[0]["img"], norm_type="dinov2")[0]  # (H, W, 3) uint8
+
+    # static + 深度マスク
+    static_mask = compute_static_mask(result, n_views, H_inf, W_inf, threshold=sf_threshold)
+    depth_z_ref = pts3d[..., 2]
+    depth_mask = (depth_z_ref > 0.01) & (depth_z_ref < max_depth)
+    combined_mask = static_mask.numpy() & depth_mask  # (H, W) bool
+
+    frame_w = W_inf * 2 if side_by_side else W_inf
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(out_dir, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_w, H_inf))
+
+    print(f"[render_mp4] {n_views} フレームをレンダリング中 → {output_path}")
+    for i in range(n_views):
+        pred_key = f"pred{i + 1}"
+        if "cam_quats" in result.get(pred_key, {}):
+            cam_quats = result[pred_key]["cam_quats"][0].cpu()
+            cam_trans = result[pred_key]["cam_trans"][0].cpu()
+            cam_rot = quaternion_to_rotation_matrix(cam_quats)
+            T_cam0_cami = torch.eye(4)
+            T_cam0_cami[:3, :3] = cam_rot
+            T_cam0_cami[:3, 3] = cam_trans
+            T_cam0_cami_np = T_cam0_cami.numpy()
+        else:
+            # cam_quats が無い場合は identity（reference frame）
+            T_cam0_cami_np = np.eye(4, dtype=np.float64)
+
+        rendered = render_pointcloud_to_image(
+            pts3d, colors_rgb, K_infer, T_cam0_cami_np,
+            H_inf, W_inf, mask=combined_mask, point_radius=point_radius,
+        )
+        rendered_bgr = cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR)
+
+        if side_by_side:
+            orig_rgb = to_rgb(preprocessed_views[i]["img"], norm_type="dinov2")[0]
+            orig_bgr = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
+            if orig_bgr.shape[:2] != (H_inf, W_inf):
+                orig_bgr = cv2.resize(orig_bgr, (W_inf, H_inf))
+            frame_bgr = np.concatenate([orig_bgr, rendered_bgr], axis=1)
+        else:
+            frame_bgr = rendered_bgr
+
+        writer.write(frame_bgr)
+        print(f"  フレーム {i + 1}/{n_views} 完了")
+
+    writer.release()
+    print(f"[render_mp4] 保存完了: {output_path}")
+
+
+# --------------------------------------------------------
 # 16. メイン処理
 # --------------------------------------------------------
 def main():
@@ -1121,9 +1300,39 @@ def main():
 
         rr.script_teardown(args)
 
+    # ---- MP4 レンダリング保存 ----
+    if args.save_mp4 is not None:
+        mp4_path = (
+            os.path.join(args.output_dir, "pointcloud_render.mp4")
+            if args.save_mp4 == "auto"
+            else args.save_mp4
+        )
+        validated_for_mp4 = validate_input_views_for_inference(all_views)
+        preprocessed_for_mp4 = preprocess_input_views_for_inference(validated_for_mp4)
+        H_v = preprocessed_for_mp4[0]["img"].shape[-2]
+        W_v = preprocessed_for_mp4[0]["img"].shape[-1]
+        for v in preprocessed_for_mp4:
+            if "non_ambiguous_mask" not in v:
+                v["non_ambiguous_mask"] = torch.ones(H_v, W_v, dtype=torch.bool)
+            if "binary_mask" not in v:
+                v["binary_mask"] = torch.ones(H_v, W_v, dtype=torch.bool)
+
+        save_pointcloud_render_mp4(
+            result=result,
+            preprocessed_views=preprocessed_for_mp4,
+            output_path=mp4_path,
+            fps=args.mp4_fps,
+            max_depth=args.max_depth,
+            sf_threshold=args.sf_threshold,
+            point_radius=1,
+            side_by_side=not args.mp4_no_side_by_side,
+        )
+
     print(f"[main] 出力ディレクトリ: {args.output_dir}")
     print("  - アンディストーション画像: undistorted/")
     print("  - スパース深度マップ: depth/")
+    if args.save_mp4 is not None:
+        print(f"  - 点群レンダリング MP4: {mp4_path}")
 
 
 # --------------------------------------------------------
@@ -1314,6 +1523,31 @@ def get_parser():
         "--list_clips",
         action="store_true",
         help="利用可能なクリップ一覧を表示して終了",
+    )
+
+    # MP4 レンダリング保存
+    parser.add_argument(
+        "--save_mp4",
+        type=str,
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="PATH",
+        help=(
+            "点群レンダリング MP4 の保存パス。"
+            "パスなしで指定した場合は output_dir/pointcloud_render.mp4 に保存。"
+        ),
+    )
+    parser.add_argument(
+        "--mp4_fps",
+        type=float,
+        default=10.0,
+        help="MP4 フレームレート",
+    )
+    parser.add_argument(
+        "--mp4_no_side_by_side",
+        action="store_true",
+        help="点群レンダリングのみ出力（デフォルトは元画像と横並び）",
     )
 
     return parser
