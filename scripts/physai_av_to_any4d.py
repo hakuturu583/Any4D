@@ -762,6 +762,13 @@ def compute_static_mask(
     Returns:
         (H, W) bool tensor。True = 静的画素
     """
+    # 利用可能キーを診断出力
+    pred1_keys = sorted(result.get("pred1", {}).keys())
+    pred2_keys = sorted(result.get("pred2", {}).keys()) if num_views > 1 else []
+    print(f"  [static_mask] pred1 keys: {pred1_keys}")
+    if pred2_keys:
+        print(f"  [static_mask] pred2 keys: {pred2_keys}")
+
     dynamic_accum = torch.zeros(H, W, dtype=torch.bool)
     n_sf_views = 0
     for i in range(1, num_views):
@@ -770,16 +777,23 @@ def compute_static_mask(
             continue
         sf = pred["scene_flow"][0].cpu()  # (H, W, 3)
         magnitude = sf.norm(dim=-1)       # (H, W)
+        n_dynamic = int((magnitude > threshold).sum().item())
+        print(f"  [static_mask] pred{i+1} scene_flow: "
+              f"max={magnitude.max():.3f}m  mean={magnitude.mean():.3f}m  "
+              f"dynamic_pixels(>{threshold}m)={n_dynamic}/{H*W} "
+              f"({100*n_dynamic/(H*W):.1f}%)")
         dynamic_accum |= (magnitude > threshold)
         n_sf_views += 1
 
     if n_sf_views == 0:
-        print("  [static_mask] scene_flow が見つかりません。全画素を static とみなします。")
+        print("  [static_mask] ⚠ scene_flow が見つかりません。全画素を static とみなします。")
         return torch.ones(H, W, dtype=torch.bool)
 
-    print(f"  [static_mask] {n_sf_views} フレームの scene_flow を使用 "
-          f"(threshold={threshold} m)")
-    return ~dynamic_accum
+    static_mask = ~dynamic_accum
+    n_static = int(static_mask.sum().item())
+    print(f"  [static_mask] {n_sf_views} フレームの scene_flow を集約 "
+          f"(threshold={threshold}m) → static: {n_static}/{H*W} ({100*n_static/(H*W):.1f}%)")
+    return static_mask
 
 
 def select_temporal_frame_indices(total_frames: int, n_frames: int) -> list[int]:
