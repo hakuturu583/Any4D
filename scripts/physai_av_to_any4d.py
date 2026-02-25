@@ -923,7 +923,8 @@ def save_pointcloud_render_mp4(
     # reference frame の点群と色
     pts3d = result["pred1"]["pts3d"][0].cpu().numpy()       # (H, W, 3) in cam0
     H_inf, W_inf = pts3d.shape[:2]
-    colors_rgb = to_rgb(preprocessed_views[0]["img"], norm_type="dinov2")[0]  # (H, W, 3) uint8
+    # to_rgb は [0, 1] float32 を返すため uint8 に変換
+    colors_rgb = (to_rgb(preprocessed_views[0]["img"], norm_type="dinov2")[0] * 255).astype(np.uint8)  # (H, W, 3)
 
     # static + 深度マスク
     static_mask = compute_static_mask(result, n_views, H_inf, W_inf, threshold=sf_threshold)
@@ -959,7 +960,7 @@ def save_pointcloud_render_mp4(
         rendered_bgr = cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR)
 
         if side_by_side:
-            orig_rgb = to_rgb(preprocessed_views[i]["img"], norm_type="dinov2")[0]
+            orig_rgb = (to_rgb(preprocessed_views[i]["img"], norm_type="dinov2")[0] * 255).astype(np.uint8)
             orig_bgr = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
             if orig_bgr.shape[:2] != (H_inf, W_inf):
                 orig_bgr = cv2.resize(orig_bgr, (W_inf, H_inf))
