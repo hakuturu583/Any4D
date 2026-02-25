@@ -32,6 +32,7 @@ dependencies = [
     "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3913c65d81e05e47b9f367250cf8c0f7462a0900",
     "depth-anything-3",
     "physical-ai-av>=0.1.0",
+    "dracopy>=2.0.0",
 ]
 
 [project.optional-dependencies]

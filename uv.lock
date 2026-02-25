@@ -68,6 +68,7 @@ version = "1.0"
 source = { editable = "." }
 dependencies = [
     { name = "depth-anything-3", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "dracopy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "einops", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "huggingface-hub", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "hydra-core", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -123,6 +124,7 @@ requires-dist = [
     { name = "any4d", extras = ["dev"], marker = "extra == 'all'" },
     { name = "any4d", extras = ["gradio"], marker = "extra == 'all'" },
     { name = "depth-anything-3", git = "https://github.com/ByteDance-Seed/Depth-Anything-3.git" },
+    { name = "dracopy", specifier = ">=2.0.0" },
     { name = "einops" },
     { name = "gradio", marker = "extra == 'gradio'", specifier = "==5.45.0" },
     { name = "gradio-rerun", marker = "extra == 'gradio'" },
@@ -427,6 +429,14 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/96/8e/709914eb2b5749865801041647dc7f4e6d00b549cfe88b65ca192995f07c/distlib-0.4.0.tar.gz", hash = "sha256:feec40075be03a04501a973d81f633735b4b69f98b05450592310c0f401a4e0d", size = 614605, upload-time = "2025-07-17T16:52:00.465Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/33/6b/e0547afaf41bf2c42e52430072fa5658766e3d65bd4b03a563d1b6336f57/distlib-0.4.0-py2.py3-none-any.whl", hash = "sha256:9659f7d87e46584a30b5780e43ac7a2143098441670ff0a49d5f9034c54a6c16", size = 469047, upload-time = "2025-07-17T16:51:58.613Z" },
+]
+
+[[package]]
+name = "dracopy"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4e/b7/28dff0bc2f992df437aaeeaeffba8f2f1ec031f054cedfc0390ea4300370/dracopy-2.0.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4d6ea2821545b5fa1cfb1ca2911ea6425a2606932cf4fac2f9b1f2d4ccb6e52d", size = 5096811, upload-time = "2025-11-11T16:14:26.18Z" },
 ]
 
 [[package]]

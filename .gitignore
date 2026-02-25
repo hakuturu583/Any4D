@@ -3,6 +3,10 @@ checkpoints/
 local/
 reference_data/
 
+# PhysicalAI-AV dataset cache & outputs
+data/physai_av_cache/
+outputs/physai_av/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

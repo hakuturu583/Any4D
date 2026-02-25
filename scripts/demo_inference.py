@@ -115,9 +115,13 @@ def log_scene_flow_to_rerun(image, pts3d, scene_flow_vecs, base_name, mask=None,
         filtered_scene_flow_vecs = scene_flow_vecs
         filtered_pts_col = image
     else:
-        filtered_pts = pts3d[mask]
-        filtered_scene_flow_vecs = scene_flow_vecs[mask]
-        filtered_pts_col = image[mask]
+        if isinstance(mask, np.ndarray):
+            bool_mask = torch.from_numpy(mask.astype(bool))
+        else:
+            bool_mask = mask.bool()
+        filtered_pts = pts3d[bool_mask]
+        filtered_scene_flow_vecs = scene_flow_vecs[bool_mask]
+        filtered_pts_col = image[bool_mask]
     
     # Check if we have any valid points
     if filtered_pts.numel() == 0:
@@ -319,7 +323,7 @@ def visualize_raw_custom_data_inference_output(args, views, pred_output, img_nor
         mask = non_ambiguous_mask.numpy() & mask
 
         # Close Depth mask
-        close_depth_mask = depth_z < 40.0
+        close_depth_mask = depth_z < getattr(args, "max_depth", 40.0)
         mask = mask & close_depth_mask
 
         if view_idx == 0:
@@ -534,6 +538,12 @@ def get_parser():
     parser.add_argument("--use_scene_flow_mask_refined", default=True)
     parser.add_argument("--viz", action="store_true")
     parser.add_argument("--port", type=int, default=9876)
+    parser.add_argument(
+        "--max_depth",
+        type=float,
+        default=40.0,
+        help="可視化する最大深度 [m]。デフォルト40m。遠景を表示したい場合は増やす（例: 100.0）",
+    )
 
     return parser
 
