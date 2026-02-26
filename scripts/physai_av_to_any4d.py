@@ -852,7 +852,8 @@ def render_pointcloud_to_image(
     out_w: int,
     mask: np.ndarray | None = None,
     point_radius: int = 1,
-) -> np.ndarray:
+    return_validity_mask: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     点群 (cam0 座標系) をカメラ i の視点からレンダリングして (out_h, out_w, 3) uint8 を返す。
 
@@ -865,9 +866,12 @@ def render_pointcloud_to_image(
         out_h, out_w: 出力解像度
         mask: 有効点マスク (H, W) または (N,) bool
         point_radius: 膨張半径 (pixel)。0 で膨張なし。
+        return_validity_mask: True の場合、(canvas, validity) タプルを返す。
+                              validity は (out_h, out_w) bool で True = 点が投影された画素。
 
     Returns:
-        (out_h, out_w, 3) uint8 RGB レンダリング画像。背景は黒。
+        return_validity_mask=False: (out_h, out_w, 3) uint8 RGB レンダリング画像。背景は黒。
+        return_validity_mask=True: ((out_h, out_w, 3) uint8, (out_h, out_w) bool) タプル。
     """
     pts = pts3d_cam0.reshape(-1, 3).astype(np.float32)
     cols = colors_rgb.reshape(-1, 3).astype(np.uint8)
@@ -878,7 +882,10 @@ def render_pointcloud_to_image(
         cols = cols[m]
 
     if len(pts) == 0:
-        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        if return_validity_mask:
+            return canvas, np.zeros((out_h, out_w), dtype=bool)
+        return canvas
 
     # T_cami_cam0 = inv(T_cam0_cami) : cam0 → cam_i
     T_np = np.array(T_cam0_cami, dtype=np.float64)
@@ -894,7 +901,10 @@ def render_pointcloud_to_image(
     cols = cols[valid]
 
     if len(pts_cami) == 0:
-        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        if return_validity_mask:
+            return canvas, np.zeros((out_h, out_w), dtype=bool)
+        return canvas
 
     # ピンホール投影
     fx, fy = float(K[0, 0]), float(K[1, 1])
@@ -909,12 +919,18 @@ def render_pointcloud_to_image(
     ui, vi, z, cols = ui[in_bounds], vi[in_bounds], z[in_bounds], cols[in_bounds]
 
     if len(ui) == 0:
-        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        if return_validity_mask:
+            return canvas, np.zeros((out_h, out_w), dtype=bool)
+        return canvas
 
     # 遠→近の順で描画 (painter's algorithm)
     order = np.argsort(z)[::-1]
     canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
     canvas[vi[order], ui[order]] = cols[order]
+
+    validity = np.zeros((out_h, out_w), dtype=bool)
+    validity[vi[order], ui[order]] = True
 
     # 点を膨張させて穴を減らす
     if point_radius > 0:
@@ -923,7 +939,11 @@ def render_pointcloud_to_image(
         dilated = cv2.dilate(canvas, kernel)
         bg = np.all(canvas == 0, axis=-1)
         canvas[bg] = dilated[bg]
+        validity_uint8 = cv2.dilate(validity.astype(np.uint8) * 255, kernel)
+        validity = validity_uint8 > 0
 
+    if return_validity_mask:
+        return canvas, validity
     return canvas
 
 
@@ -1381,7 +1401,7 @@ def main():
 
     # ---- スライディングウィンドウ用に絶対姿勢をコピーして保存 ----
     # 後続の相対姿勢変換（in-place）の前に world 座標系の poses を退避する。
-    if args.sliding_mp4 is not None:
+    if args.sliding_mp4 is not None or args.inpaint:
         all_views_world = [
             {**v, "camera_poses": v["camera_poses"].clone()}
             if "camera_poses" in v else dict(v)
@@ -1516,6 +1536,30 @@ def main():
             side_by_side=not args.mp4_no_side_by_side,
         )
 
+    # ---- インペインティング MP4 ----
+    if args.inpaint:
+        from video_inpainting import save_sliding_window_inpainted_mp4
+
+        inpaint_output = args.inpaint_output or os.path.join(args.output_dir, "inpainted.mp4")
+        ip_model, ip_device = _init_any4d_model(args)
+        save_sliding_window_inpainted_mp4(
+            all_views_world=all_views_world,
+            model=ip_model,
+            device=ip_device,
+            output_path=inpaint_output,
+            window_size=args.window_size,
+            window_stride=args.window_stride,
+            fps=args.mp4_fps,
+            max_depth=args.max_depth,
+            sf_percentile=args.sf_percentile,
+            side_by_side=not args.mp4_no_side_by_side,
+            dilate_px=args.inpaint_dilate,
+            point_radius=args.inpaint_point_radius,
+            subvideo_length=args.inpaint_subvideo_length,
+            propainter_weights_dir=args.inpaint_weights_dir,
+            fp16=not args.no_inpaint_fp16,
+        )
+
     print(f"[main] 出力ディレクトリ: {args.output_dir}")
     print("  - アンディストーション画像: undistorted/")
     print("  - スパース深度マップ: depth/")
@@ -1523,6 +1567,8 @@ def main():
         print(f"  - 点群レンダリング MP4: {mp4_path}")
     if args.sliding_mp4 is not None:
         print(f"  - スライディングウィンドウ MP4: {args.sliding_mp4}")
+    if args.inpaint:
+        print(f"  - インペインティング MP4: {inpaint_output}")
 
 
 # --------------------------------------------------------
@@ -1779,6 +1825,48 @@ def get_parser():
             "window_size の半分で 50%% オーバーラップ（デフォルト）。"
             "小さいほど密な再構成になるが推論回数が増える。"
         ),
+    )
+
+    # インペインティング
+    parser.add_argument(
+        "--inpaint",
+        action="store_true",
+        help="ProPainter を使用して動的物体除去後の穴をインペインティングする。",
+    )
+    parser.add_argument(
+        "--inpaint_output",
+        type=str,
+        default=None,
+        help="インペインティング済み MP4 の出力パス。省略時は outputs/inpainted.mp4",
+    )
+    parser.add_argument(
+        "--inpaint_dilate",
+        type=int,
+        default=8,
+        help="インペインティングマスクの膨張量 (px)。デフォルト: 8",
+    )
+    parser.add_argument(
+        "--inpaint_point_radius",
+        type=int,
+        default=2,
+        help="点群レンダリング時の点の膨張半径 (px)。大きいほど有効画素が増え穴が減る。デフォルト: 2",
+    )
+    parser.add_argument(
+        "--inpaint_subvideo_length",
+        type=int,
+        default=80,
+        help="ProPainter サブビデオ分割長。VRAM 不足時は 40 に下げる。デフォルト: 80",
+    )
+    parser.add_argument(
+        "--inpaint_weights_dir",
+        type=str,
+        default="checkpoints/propainter",
+        help="ProPainter 重みファイルのディレクトリ。デフォルト: checkpoints/propainter",
+    )
+    parser.add_argument(
+        "--no_inpaint_fp16",
+        action="store_true",
+        help="ProPainter を fp32 で実行する（デフォルトは fp16）。",
     )
 
     return parser

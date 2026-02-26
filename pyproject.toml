@@ -43,7 +43,6 @@ gradio = [
     "gradio_rerun",
     "spaces"
 ]
-
 # Install all optional dependencies
 all = [
     "any4d[data]",
