@@ -8,7 +8,7 @@ version = "1.0"
 description = "Unified Feed-Forward Metric 4D Reconstruction"
 readme = "readme.md"
 authors = [{ name = "Jay Karhade", email = "jaykarhade3@gmail.com" }]
-requires-python = ">=3.10.0"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "huggingface_hub",
     "hydra-core",
@@ -29,7 +29,10 @@ dependencies = [
     "matplotlib",
     "einops",
     "uniception @ git+https://github.com/JayKarhade/UniCeption.git@dev/any4d",
-    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3913c65d81e05e47b9f367250cf8c0f7462a0900"
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3913c65d81e05e47b9f367250cf8c0f7462a0900",
+    "depth-anything-3",
+    "physical-ai-av>=0.1.0",
+    "dracopy>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +43,6 @@ gradio = [
     "gradio_rerun",
     "spaces"
 ]
-
 # Install all optional dependencies
 all = [
     "any4d[data]",
@@ -72,3 +74,10 @@ combine-as-imports = true
 detect-same-package = false
 order-by-type = false
 known-first-party = ["any4d", "uniception"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+override-dependencies = ["numpy>=2.0.0"]
+
+[tool.uv.sources]
+depth-anything-3 = { git = "https://github.com/ByteDance-Seed/Depth-Anything-3.git" }
