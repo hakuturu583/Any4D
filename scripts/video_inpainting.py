@@ -100,6 +100,97 @@ def _pad_to_multiple(img: np.ndarray, multiple: int = 8) -> tuple[np.ndarray, tu
     return padded, (pad_h, pad_w)
 
 
+def _project_pts_to_flow(
+    pts3d_src: np.ndarray,
+    K_dst: np.ndarray,
+    T_world_src: np.ndarray,
+    T_world_dst: np.ndarray,
+    validity_src: np.ndarray,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """
+    pts3d_src (cam_src 座標系) を cam_dst に投影し、光学フロー (2, H, W) を返す。
+
+    flow[0] = u_dst - u_src (水平方向)
+    flow[1] = v_dst - v_src (垂直方向)
+
+    無効画素 (validity=False, z<=0, 画像外) はフロー=0。
+    """
+    # T_dst_src = inv(T_world_dst) @ T_world_src
+    T_dst_src = np.linalg.inv(T_world_dst) @ T_world_src  # (4, 4)
+    R = T_dst_src[:3, :3].astype(np.float32)
+    t = T_dst_src[:3, 3].astype(np.float32)
+
+    # pts3d_src を dst カメラ座標系に変換
+    pts = pts3d_src.reshape(-1, 3).astype(np.float32)
+    pts_dst = (R @ pts.T).T + t  # (N, 3)
+
+    # ピンホール投影
+    fx, fy = float(K_dst[0, 0]), float(K_dst[1, 1])
+    cx, cy = float(K_dst[0, 2]), float(K_dst[1, 2])
+    z = pts_dst[:, 2].reshape(H, W)
+    u_dst = (fx * pts_dst[:, 0] / (z.ravel() + 1e-8) + cx).reshape(H, W)
+    v_dst = (fy * pts_dst[:, 1] / (z.ravel() + 1e-8) + cy).reshape(H, W)
+
+    # ソース画素座標グリッド
+    uu = np.tile(np.arange(W, dtype=np.float32), (H, 1))
+    vv = np.tile(np.arange(H, dtype=np.float32).reshape(H, 1), (1, W))
+
+    flow_u = (u_dst - uu).astype(np.float32)
+    flow_v = (v_dst - vv).astype(np.float32)
+
+    # 無効領域をゼロに
+    invalid = (~validity_src) | (z <= 0) | (u_dst < 0) | (u_dst >= W) | (v_dst < 0) | (v_dst >= H)
+    flow_u[invalid] = 0.0
+    flow_v[invalid] = 0.0
+
+    return np.stack([flow_u, flow_v], axis=0)  # (2, H, W)
+
+
+def compute_geometric_flows(
+    pts3d_list: list[np.ndarray],
+    K_list: list[np.ndarray],
+    poses_list: list[np.ndarray],
+    validity_list: list[np.ndarray],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Any4D の pts3d・カメラ姿勢から幾何学的に正確な光学フローを計算する。
+
+    RAFT のような画像ベース推定と異なり、3D 幾何から直接導出するため
+    カメラ自己運動が大きい場合でも誤差が生じない。
+
+    Args:
+        pts3d_list:   N × (H, W, 3) float  各フレームの点群 (cam_i 座標系)
+        K_list:       N × (3, 3)            カメラ内部行列
+        poses_list:   N × (4, 4)            T_world_cam (cam→world)
+        validity_list: N × (H, W) bool      有効画素マスク
+
+    Returns:
+        gt_flows_f: (1, N-1, 2, H, W) float32  前向きフロー (frame i → i+1)
+        gt_flows_b: (1, N-1, 2, H, W) float32  後ろ向きフロー (frame i+1 → i)
+    """
+    N = len(pts3d_list)
+    H, W = pts3d_list[0].shape[:2]
+    flows_f, flows_b = [], []
+
+    for i in range(N - 1):
+        flows_f.append(_project_pts_to_flow(
+            pts3d_list[i], K_list[i + 1],
+            poses_list[i], poses_list[i + 1],
+            validity_list[i], H, W,
+        ))
+        flows_b.append(_project_pts_to_flow(
+            pts3d_list[i + 1], K_list[i],
+            poses_list[i + 1], poses_list[i],
+            validity_list[i + 1], H, W,
+        ))
+
+    gt_flows_f = torch.from_numpy(np.stack(flows_f)).unsqueeze(0)  # (1, N-1, 2, H, W)
+    gt_flows_b = torch.from_numpy(np.stack(flows_b)).unsqueeze(0)
+    return gt_flows_f, gt_flows_b
+
+
 def run_propainter_inpaint(
     frames_rgb: list[np.ndarray],
     masks: list[tuple[Image.Image, Image.Image]],
@@ -110,6 +201,8 @@ def run_propainter_inpaint(
     ref_stride: int = 10,
     fp16: bool = True,
     raft_iter: int = 20,
+    geo_flows_f: torch.Tensor | None = None,
+    geo_flows_b: torch.Tensor | None = None,
 ) -> list[np.ndarray]:
     """
     ProPainter Python API でインペインティングを実行する。
@@ -222,34 +315,44 @@ def run_propainter_inpaint(
         flow_masks_tensor = flow_masks_tensor.half()
         masks_dilated_tensor = masks_dilated_tensor.half()
 
-    # ---- Step 1: RAFT 光学フロー計算 ----
-    print("[inpaint] RAFT 光学フロー計算中...")
-    short_clip_len = max(subvideo_length // 2, 12)
-    # フレーム幅に応じて調整
-    if w <= 640:
-        short_clip_len = 80
-    elif w <= 1280:
-        short_clip_len = 40
+    # ---- Step 1: 光学フロー計算 ----
+    if geo_flows_f is not None and geo_flows_b is not None:
+        # 幾何フローを使用（RAFT スキップ）
+        # geo_flows は元解像度 (h_orig, w_orig) で計算済み → パディング後サイズに合わせる
+        print("[inpaint] 幾何フローを使用（RAFT スキップ）...")
+        import torch.nn.functional as F
+        gt_flows_f = geo_flows_f.to(device)
+        gt_flows_b = geo_flows_b.to(device)
+        if pad_h > 0 or pad_w > 0:
+            gt_flows_f = F.pad(gt_flows_f, (0, pad_w, 0, pad_h))
+            gt_flows_b = F.pad(gt_flows_b, (0, pad_w, 0, pad_h))
     else:
-        short_clip_len = 20
-
-    gt_flows_f_list, gt_flows_b_list = [], []
-    with torch.no_grad():
-        if frames_tensor.size(1) > short_clip_len:
-            for f_start in range(0, video_length, short_clip_len):
-                f_end = min(video_length, f_start + short_clip_len)
-                if f_start == 0:
-                    flows_f, flows_b = fix_raft(frames_tensor[:, f_start:f_end].float(), iters=raft_iter)
-                else:
-                    flows_f, flows_b = fix_raft(frames_tensor[:, f_start - 1:f_end].float(), iters=raft_iter)
-                gt_flows_f_list.append(flows_f)
-                gt_flows_b_list.append(flows_b)
-            gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
-            gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+        print("[inpaint] RAFT 光学フロー計算中...")
+        short_clip_len = max(subvideo_length // 2, 12)
+        if w <= 640:
+            short_clip_len = 80
+        elif w <= 1280:
+            short_clip_len = 40
         else:
-            gt_flows_f, gt_flows_b = fix_raft(frames_tensor.float(), iters=raft_iter)
+            short_clip_len = 20
 
-    # RAFT は常に float32 を出力する。fix_flow_complete が fp16 の場合は合わせてキャスト。
+        gt_flows_f_list, gt_flows_b_list = [], []
+        with torch.no_grad():
+            if frames_tensor.size(1) > short_clip_len:
+                for f_start in range(0, video_length, short_clip_len):
+                    f_end = min(video_length, f_start + short_clip_len)
+                    if f_start == 0:
+                        flows_f, flows_b = fix_raft(frames_tensor[:, f_start:f_end].float(), iters=raft_iter)
+                    else:
+                        flows_f, flows_b = fix_raft(frames_tensor[:, f_start - 1:f_end].float(), iters=raft_iter)
+                    gt_flows_f_list.append(flows_f)
+                    gt_flows_b_list.append(flows_b)
+                gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
+                gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+            else:
+                gt_flows_f, gt_flows_b = fix_raft(frames_tensor.float(), iters=raft_iter)
+
+    # RAFT / 幾何フローともに float32 → fp16 の場合はキャスト
     if fp16:
         gt_flows_f = gt_flows_f.half()
         gt_flows_b = gt_flows_b.half()
@@ -417,6 +520,9 @@ def save_sliding_window_inpainted_mp4(
     fps: float,
     max_depth: float,
     sf_percentile: float,
+    sf_abs_threshold: float | None = None,
+    sf_close_px: int = 0,
+    sf_dilate_px: int = 0,
     side_by_side: bool = True,
     dilate_px: int = 8,
     point_radius: int = 2,
@@ -480,9 +586,12 @@ def save_sliding_window_inpainted_mp4(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     # Phase 1: スライディングウィンドウ推論 + validity_mask 収集
-    collected_frames = []  # 元画像 RGB (H, W, 3) uint8
+    collected_frames = []    # 元画像 RGB (H, W, 3) uint8
     collected_rendered = []  # 点群レンダリング RGB (H, W, 3) uint8
     collected_validity = []  # validity_mask (H, W) bool
+    collected_pts3d = []     # 点群 (H, W, 3) in cam_i 座標系
+    collected_K = []         # カメラ内部行列 (3, 3)
+    collected_poses = []     # T_world_cam (4, 4) 絶対姿勢
 
     for wi, start in enumerate(window_starts):
         window_views_world = all_views_world[start:start + window_size]
@@ -493,7 +602,11 @@ def save_sliding_window_inpainted_mp4(
         H = preprocessed[0]["img"].shape[-2]
         W = preprocessed[0]["img"].shape[-1]
         static_mask = compute_static_mask(
-            result, len(window_views_rel), H, W, sf_percentile=sf_percentile
+            result, len(window_views_rel), H, W,
+            sf_percentile=sf_percentile,
+            sf_abs_threshold=sf_abs_threshold,
+            sf_close_px=sf_close_px,
+            sf_dilate_px=sf_dilate_px,
         )
 
         ray_dirs = result["pred1"]["ray_directions"][0].cpu()
@@ -502,6 +615,9 @@ def save_sliding_window_inpainted_mp4(
         colors_rgb = (to_rgb(preprocessed[0]["img"], norm_type="dinov2")[0] * 255).astype(
             np.uint8
         )
+
+        # 幾何フロー計算用に絶対姿勢を収集（window_views_world[0] が当該フレームの cam0）
+        T_world_cam = window_views_world[0]["camera_poses"][0].cpu().numpy()  # (4, 4)
 
         depth_mask = (pts3d[..., 2] > 0.01) & (pts3d[..., 2] < max_depth)
         combined_mask = static_mask.numpy() & depth_mask
@@ -521,6 +637,9 @@ def save_sliding_window_inpainted_mp4(
         collected_frames.append(colors_rgb.copy())
         collected_rendered.append(rendered.copy())
         collected_validity.append(validity.copy())
+        collected_pts3d.append(pts3d.copy())
+        collected_K.append(K_infer.copy())
+        collected_poses.append(T_world_cam.copy())
 
         print(
             f"  [inpaint] window {wi + 1}/{len(window_starts)}: "
@@ -534,6 +653,29 @@ def save_sliding_window_inpainted_mp4(
     torch.cuda.empty_cache()
     gc.collect()
 
+    # Phase 2.5: 幾何フロー計算（RAFT の代替）
+    geo_flows_f = None
+    geo_flows_b = None
+    if len(collected_pts3d) >= 2:
+        print("[inpaint] Phase 2.5: 幾何フロー計算中...")
+        try:
+            geo_flows_f, geo_flows_b = compute_geometric_flows(
+                collected_pts3d,
+                collected_K,
+                collected_poses,
+                collected_validity,
+            )
+            print(
+                f"  幾何フロー計算完了: shape={geo_flows_f.shape} "
+                f"(フレーム間フロー {geo_flows_f.shape[1]} ペア)"
+            )
+        except Exception as e:
+            print(f"  [警告] 幾何フロー計算に失敗しました ({e})。RAFT にフォールバックします。")
+            geo_flows_f = None
+            geo_flows_b = None
+    else:
+        print("[inpaint] Phase 2.5: フレーム数 < 2 のため幾何フロー計算をスキップ")
+
     # Phase 3: インペインティングマスク生成 + ProPainter 実行
     print("[inpaint] Phase 3: インペインティングマスク生成中...")
     inpaint_masks = [generate_inpaint_masks(v, dilate_px=dilate_px) for v in collected_validity]
@@ -545,13 +687,32 @@ def save_sliding_window_inpainted_mp4(
     print(f"  マスク生成完了: 合計穴画素数 = {n_holes:,}")
 
     print("[inpaint] Phase 3: ProPainter インペインティング開始...")
+    # ProPainter に渡す合成画像を作成する。
+    # - inpaint マスク外（validity=True かつ補完対象外）→ 点群レンダリング色
+    # - inpaint マスク内（dilated mask 領域）         → 元カメラ色
+    #
+    # 単純に ~validity で埋めると点群端の暗い画素（点密度低下領域）が
+    # マスク膨張部分に残り、ProPainter がその黒・藍色を周囲に滲ませる。
+    # dilated mask 全体を元カメラ色で埋めることで ProPainter が
+    # 明るく自然な初期値から補完できる。
+    collected_composite = []
+    for rendered, original, (_, mask_dilated_pil) in zip(
+        collected_rendered, collected_frames, inpaint_masks
+    ):
+        mask_np = np.array(mask_dilated_pil) > 0  # (H, W) bool
+        composite = rendered.copy()
+        composite[mask_np] = original[mask_np]
+        collected_composite.append(composite)
+
     inpainted_frames = run_propainter_inpaint(
-        frames_rgb=collected_frames,
+        frames_rgb=collected_composite,
         masks=inpaint_masks,
         device=device,
         propainter_weights_dir=propainter_weights_dir,
         subvideo_length=subvideo_length,
         fp16=fp16,
+        geo_flows_f=geo_flows_f,
+        geo_flows_b=geo_flows_b,
     )
 
     # Phase 4: MP4 保存

@@ -1,0 +1,26 @@
+# Any4D 実行設定ファイル
+# 使い方: python scripts/physai_av_to_any4d.py --run_config configs/inpaint_example.yaml
+# CLI 引数は常にこのファイルの設定より優先される
+
+# --- クリップ指定 ---
+clip_id: 2edf278f-d5e3-4b83-b5df-923a04335725
+num_frames: 32
+frame_stride: 1
+
+# --- 動的物体判定 ---
+sf_percentile: 0.85        # 上位15%を動的と判定
+sf_abs_threshold: 0.05     # 0.05m/frame 以上は必ず動的
+sf_close_px: 10            # 動的物体内の穴を埋める
+sf_dilate_px: 5            # 検出端部を拡張
+
+# --- インペインティング ---
+inpaint: true
+inpaint_output: outputs/inpainted.mp4
+inpaint_dilate: 8
+inpaint_point_radius: 1
+inpaint_subvideo_length: 80
+# no_inpaint_fp16: false   # fp16 を使う（デフォルト）
+
+# --- レンダリング ---
+max_depth: 300.0
+# mp4_no_side_by_side: false

@@ -16,6 +16,8 @@ import sys
 import warnings
 from pathlib import Path
 
+import yaml
+
 import cv2
 import numpy as np
 import torch
@@ -766,6 +768,9 @@ def compute_static_mask(
     H: int,
     W: int,
     sf_percentile: float = 0.90,
+    sf_abs_threshold: float | None = None,
+    sf_close_px: int = 0,
+    sf_dilate_px: int = 0,
 ) -> torch.Tensor:
     """
     世界座標系の scene_flow magnitude のパーセンタイル閾値で動的画素を検出。
@@ -778,6 +783,12 @@ def compute_static_mask(
         num_views: 総ビュー数（reference 1 + temporal N-1）
         H, W: 画像の高さ・幅
         sf_percentile: 動的判定の下限パーセンタイル（0〜1）。小さいほど厳しい判定
+        sf_abs_threshold: 絶対閾値 [m/frame]。None で無効。パーセンタイルと OR で使用。
+                          シーン全体の動きによらず「この値以上は必ず動的」にしたい場合に有効。
+        sf_close_px: 動的マスクの morphological closing 半径 [px]。
+                     動的物体内の穴（scene_flow が低い部位）を埋める。
+        sf_dilate_px: 動的マスクの膨張半径 [px]。
+                      検出端部を広げて輪郭の取り残しを防ぐ。
 
     Returns:
         (H, W) bool tensor。True = 静的画素
@@ -803,15 +814,37 @@ def compute_static_mask(
     pooled = torch.cat(all_magnitudes)
     tau = torch.quantile(pooled, sf_percentile)
 
-    print(f"  [static_mask] scene_flow: p{sf_percentile*100:.0f}={tau:.4f}m  (median={pooled.median():.4f}m)")
+    abs_info = f", abs_thr={sf_abs_threshold:.4f}m" if sf_abs_threshold is not None else ""
+    print(f"  [static_mask] scene_flow: p{sf_percentile*100:.0f}={tau:.4f}m  "
+          f"(median={pooled.median():.4f}m{abs_info})")
 
     # 3. 各フレームで動的判定し OR 集約
     dynamic_accum = torch.zeros(H, W, dtype=torch.bool)
     for pred_idx, mag in per_frame_magnitudes:
-        n_dyn = int((mag > tau).sum().item())
+        dynamic = mag > tau
+        if sf_abs_threshold is not None:
+            dynamic |= (mag > sf_abs_threshold)
+        n_dyn = int(dynamic.sum().item())
         print(f"  [static_mask] pred{pred_idx}: "
-              f"dynamic(>{tau:.4f}m)={n_dyn}/{H*W} ({100*n_dyn/(H*W):.1f}%)")
-        dynamic_accum |= (mag > tau)
+              f"dynamic={n_dyn}/{H*W} ({100*n_dyn/(H*W):.1f}%)")
+        dynamic_accum |= dynamic
+
+    # 4. 形態学的処理で検出精度を向上
+    dynamic_np = dynamic_accum.numpy().astype(np.uint8) * 255
+
+    if sf_close_px > 0:
+        # closing: 動的物体内の穴を埋める（car のボンネット等で flow が低い部位の取り残し対策）
+        k = 2 * sf_close_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dynamic_np = cv2.morphologyEx(dynamic_np, cv2.MORPH_CLOSE, kernel)
+
+    if sf_dilate_px > 0:
+        # dilation: 検出端部を拡張して輪郭の取り残しを防ぐ
+        k = 2 * sf_dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dynamic_np = cv2.dilate(dynamic_np, kernel)
+
+    dynamic_accum = torch.from_numpy(dynamic_np > 0)
 
     static_mask = ~dynamic_accum
     n_static = int(static_mask.sum().item())
@@ -954,6 +987,9 @@ def save_pointcloud_render_mp4(
     fps: float = 10.0,
     max_depth: float = 40.0,
     sf_percentile: float = 0.90,
+    sf_abs_threshold: float | None = None,
+    sf_close_px: int = 0,
+    sf_dilate_px: int = 0,
     point_radius: int = 1,
     side_by_side: bool = True,
 ) -> None:
@@ -992,7 +1028,11 @@ def save_pointcloud_render_mp4(
     colors_rgb = (to_rgb(preprocessed_views[0]["img"], norm_type="dinov2")[0] * 255).astype(np.uint8)  # (H, W, 3)
 
     # static + 深度マスク
-    static_mask = compute_static_mask(result, n_views, H_inf, W_inf, sf_percentile=sf_percentile)
+    static_mask = compute_static_mask(result, n_views, H_inf, W_inf,
+                                      sf_percentile=sf_percentile,
+                                      sf_abs_threshold=sf_abs_threshold,
+                                      sf_close_px=sf_close_px,
+                                      sf_dilate_px=sf_dilate_px)
     depth_z_ref = pts3d[..., 2]
     depth_mask = (depth_z_ref > 0.01) & (depth_z_ref < max_depth)
     combined_mask = static_mask.numpy() & depth_mask  # (H, W) bool
@@ -1072,7 +1112,10 @@ def save_sliding_window_mp4(
     fps: float,
     max_depth: float,
     sf_percentile: float,
-    side_by_side: bool,
+    sf_abs_threshold: float | None = None,
+    sf_close_px: int = 0,
+    sf_dilate_px: int = 0,
+    side_by_side: bool = True,
 ) -> None:
     """
     スライディングウィンドウで各 reference frame を推論し MP4 に保存する。
@@ -1117,7 +1160,11 @@ def save_sliding_window_mp4(
 
         H = preprocessed[0]["img"].shape[-2]
         W = preprocessed[0]["img"].shape[-1]
-        static_mask = compute_static_mask(result, len(window_views_rel), H, W, sf_percentile=sf_percentile)
+        static_mask = compute_static_mask(result, len(window_views_rel), H, W,
+                                          sf_percentile=sf_percentile,
+                                          sf_abs_threshold=sf_abs_threshold,
+                                          sf_close_px=sf_close_px,
+                                          sf_dilate_px=sf_dilate_px)
 
         # reference frame（ウィンドウ先頭）の点群を cam0 座標系でレンダリング
         ray_dirs = result["pred1"]["ray_directions"][0].cpu()
@@ -1163,6 +1210,16 @@ def save_sliding_window_mp4(
 def main():
     parser = get_parser()
     script_add_rerun_args(parser)
+
+    # ---- YAML 設定ファイルのロード ----
+    # Step 1: --run_config だけ先に取り出す（他の引数はまだ検証しない）
+    pre_args, _ = parser.parse_known_args()
+    if pre_args.run_config is not None:
+        yaml_cfg = _load_yaml_config(pre_args.run_config)
+        parser.set_defaults(**yaml_cfg)
+        print(f"[config] YAML 設定をロード: {pre_args.run_config} ({len(yaml_cfg)} keys)")
+
+    # Step 2: 全引数を正式にパース（CLI 引数が YAML defaults を上書き）
     args = parser.parse_args()
 
     seed_everything(0)
@@ -1455,7 +1512,11 @@ def main():
         # ---- static マスク計算 ----
         # 全時系列フレームの scene_flow magnitude を集約し、
         # 閾値以上の動きがある画素を動的とみなして除去する
-        static_mask = compute_static_mask(result, len(preprocessed), H_v, W_v, sf_percentile=args.sf_percentile)
+        static_mask = compute_static_mask(result, len(preprocessed), H_v, W_v,
+                                          sf_percentile=args.sf_percentile,
+                                          sf_abs_threshold=args.sf_abs_threshold,
+                                          sf_close_px=args.sf_close_px,
+                                          sf_dilate_px=args.sf_dilate_px)
         n_static = int(static_mask.sum().item())
         n_total = H_v * W_v
         print(f"[viz] static マスク: {n_static}/{n_total} 画素 "
@@ -1516,6 +1577,9 @@ def main():
             fps=args.mp4_fps,
             max_depth=args.max_depth,
             sf_percentile=args.sf_percentile,
+            sf_abs_threshold=args.sf_abs_threshold,
+            sf_close_px=args.sf_close_px,
+            sf_dilate_px=args.sf_dilate_px,
             point_radius=1,
             side_by_side=not args.mp4_no_side_by_side,
         )
@@ -1533,6 +1597,9 @@ def main():
             fps=args.mp4_fps,
             max_depth=args.max_depth,
             sf_percentile=args.sf_percentile,
+            sf_abs_threshold=args.sf_abs_threshold,
+            sf_close_px=args.sf_close_px,
+            sf_dilate_px=args.sf_dilate_px,
             side_by_side=not args.mp4_no_side_by_side,
         )
 
@@ -1552,6 +1619,9 @@ def main():
             fps=args.mp4_fps,
             max_depth=args.max_depth,
             sf_percentile=args.sf_percentile,
+            sf_abs_threshold=args.sf_abs_threshold,
+            sf_close_px=args.sf_close_px,
+            sf_dilate_px=args.sf_dilate_px,
             side_by_side=not args.mp4_no_side_by_side,
             dilate_px=args.inpaint_dilate,
             point_radius=args.inpaint_point_radius,
@@ -1644,12 +1714,40 @@ def _parse_lidar_data(lidar_data) -> tuple[np.ndarray | None, list | None]:
 
 
 # --------------------------------------------------------
+# --------------------------------------------------------
+# YAML 設定ロード
+# --------------------------------------------------------
+def _load_yaml_config(path: str) -> dict:
+    """
+    YAML 設定ファイルをロードして argparse のデフォルト値用 dict を返す。
+
+    - キーは argparse の dest 名（ハイフンをアンダースコアに変換）
+    - store_true なフラグは YAML で true/false で記述する
+    - CLI 引数は常に YAML より優先される（parser.set_defaults で設定するため）
+    """
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+
+    # キーを argparse の dest 形式（ハイフン→アンダースコア）に正規化
+    return {k.replace("-", "_"): v for k, v in cfg.items()}
+
+
+# --------------------------------------------------------
 # 引数パーサー
 # --------------------------------------------------------
 def get_parser():
     parser = argparse.ArgumentParser(
         description="PhysicalAI-AV → Any4D 4D再構成スクリプト",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # YAML 設定ファイル
+    parser.add_argument(
+        "--run_config",
+        type=str,
+        default=None,
+        metavar="CONFIG.yaml",
+        help="YAML 設定ファイルのパス。CLI 引数は常に YAML より優先される。",
     )
 
     # クリップ指定
@@ -1797,6 +1895,36 @@ def get_parser():
             "動的物体判定のパーセンタイル閾値（0〜1）。"
             "この値以上の scene_flow magnitude を持つ画素を動的とみなす。"
             "小さいほど厳しい判定（例: 0.85=上位15%%、0.90=上位10%%、0.95=上位5%%）。"
+        ),
+    )
+    parser.add_argument(
+        "--sf_abs_threshold",
+        type=float,
+        default=None,
+        help=(
+            "動的物体判定の絶対閾値 [m/frame]。"
+            "この値以上の scene_flow magnitude を持つ画素は常に動的とみなす（パーセンタイルと OR）。"
+            "シーン全体の動き量によらず確実に除去したい場合に有効。例: 0.05"
+        ),
+    )
+    parser.add_argument(
+        "--sf_close_px",
+        type=int,
+        default=0,
+        help=(
+            "動的マスクの morphological closing 半径 [px]。"
+            "動的物体内部の穴（car ボンネット等で flow が低い部位）を埋める。"
+            "デフォルト: 0（無効）。推奨: 5〜15。"
+        ),
+    )
+    parser.add_argument(
+        "--sf_dilate_px",
+        type=int,
+        default=0,
+        help=(
+            "動的マスクの膨張半径 [px]。"
+            "検出端部を広げて輪郭の取り残しを防ぐ。"
+            "デフォルト: 0（無効）。推奨: 3〜10。"
         ),
     )
 
